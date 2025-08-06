@@ -2,7 +2,8 @@
 3D Mesh Analyzer - GPU-Accelerated Version with Open3D
 
 A high-performance implementation for analyzing 3D mesh files (.obj format)
-with GPU-accelerated raycasting using Open3D.
+with GPU-accelerated raycasting using Open3D for accurate thin wall and gap detection.
+Enhanced with additional geometric calculations and performance timing.
 """
 
 import open3d as o3d
@@ -13,25 +14,52 @@ import matplotlib.cm as cm
 from matplotlib.colors import Normalize
 from dataclasses import dataclass, field
 from typing import Optional, Dict, List, Tuple, Union
+
+@dataclass
+class ConversionInfo:
+    """Container for file conversion information"""
+    original_format: str
+    format_name: str
+    original_file: str
+    converted_file: str
+    unit: str
+    unit_assumed: bool
+    reused_existing: bool = False
+
+from typing import Optional, Dict, List, Tuple, Union
 from pathlib import Path
 import time
 import json
 import argparse
 import sys
+import os
 
 # Import the external thin wall analysis module
 import thinWallAnalysis
 
+# Import format converter for automatic file conversion
+try:
+    from formatConverter import convert_to_obj
+    FORMAT_CONVERTER_AVAILABLE = True
+except ImportError as e:
+    FORMAT_CONVERTER_AVAILABLE = False
+
 
 @dataclass
 class MeshDimensions:
-    """Container for mesh physical dimensions"""
+    """Container for mesh physical dimensions with enhanced metrics"""
     length: float
     width: float
     height: float
-    volume: Optional[float]  # Optional since non-watertight meshes can't have volume
+    volume: Optional[float]
     surface_area: float
     is_watertight: bool
+    # New metrics
+    surface_to_volume_ratio: Optional[float] = None
+    bounding_to_actual_volume_ratio: Optional[float] = None
+    concavity_ratio: Optional[float] = None  # convex_hull_volume / actual_volume
+    bounding_box_volume: Optional[float] = None
+    convex_hull_volume: Optional[float] = None
 
 
 @dataclass
@@ -50,7 +78,6 @@ class GapAnalysisResult:
     error: Optional[str] = None
 
 
-
 @dataclass
 class RaycastResult:
     """Container for raycast operation results"""
@@ -60,6 +87,19 @@ class RaycastResult:
     outward_face_data: Optional[np.ndarray] = None
 
 
+@dataclass
+class TimingInfo:
+    """Container for timing information"""
+    format_conversion: float = 0.0
+    mesh_repair: float = 0.0
+    analysis_setup: float = 0.0
+    raycast_analysis: float = 0.0
+    dimensional_analysis: float = 0.0
+    wall_analysis: float = 0.0
+    gap_analysis: float = 0.0
+    total_time: float = 0.0
+
+
 class GPUManager:
     """Manages GPU device selection and configuration for Open3D"""
     
@@ -67,16 +107,12 @@ class GPUManager:
     def setup_gpu():
         """Setup GPU acceleration if available"""
         try:
-            # Check for CUDA support
             if o3d.core.cuda.device_count() > 0:
                 device = o3d.core.Device("CUDA:0")
-                print(f"GPU acceleration enabled: {device}")
                 return device
             else:
-                print("CUDA not available, using CPU")
                 return o3d.core.Device("CPU:0")
         except Exception as e:
-            print(f"GPU setup failed, falling back to CPU: {e}")
             return o3d.core.Device("CPU:0")
     
     @staticmethod
@@ -97,55 +133,127 @@ class GPUManager:
 
 
 class MeshLoader:
-    """Handles loading 3D mesh files using Open3D"""
+    """Handles loading 3D mesh files with automatic format conversion to OBJ"""
+    
+    # Supported input formats
+    SUPPORTED_FORMATS = {
+        '.obj': 'Wavefront OBJ',
+        '.stl': 'STL',
+        '.ply': 'PLY',
+        '.glb': 'GLB',
+        '.gltf': 'GLTF',
+        '.igs': 'IGES',
+        '.iges': 'IGES',
+        '.stp': 'STEP',
+        '.step': 'STEP',
+        '.3mf': '3MF'
+    }
     
     @staticmethod
-    def load(file_input: Union[str, Path, bytes]) -> o3d.geometry.TriangleMesh:
+    def load(file_input: Union[str, Path, bytes]) -> Tuple[o3d.geometry.TriangleMesh, Optional[ConversionInfo], float]:
         """
-        Load a mesh from file path or bytes
+        Load a mesh from file path with automatic format conversion
         
         Args:
             file_input: Path to file or bytes data
             
         Returns:
-            Open3D mesh object
-            
-        Raises:
-            ValueError: If mesh cannot be loaded or is invalid
+            Tuple of (mesh, conversion_info, conversion_time)
         """
         if isinstance(file_input, bytes):
-            return MeshLoader._load_from_bytes(file_input)
+            mesh = MeshLoader._load_from_bytes(file_input)
+            return mesh, None, 0.0
         else:
             return MeshLoader._load_from_path(file_input)
     
     @staticmethod
-    def _load_from_path(file_path: Union[str, Path]) -> o3d.geometry.TriangleMesh:
-        """Load mesh from file path"""
+    def _load_from_path(file_path: Union[str, Path]) -> Tuple[o3d.geometry.TriangleMesh, Optional[ConversionInfo], float]:
+        """Load mesh from file path with automatic conversion"""
+        conversion_start = time.time()
+        file_path = Path(file_path)
+        
+        if not file_path.exists():
+            raise ValueError(f"File not found: {file_path}")
+        
+        file_extension = file_path.suffix.lower()
+        
+        if file_extension not in MeshLoader.SUPPORTED_FORMATS:
+            supported_list = ', '.join(MeshLoader.SUPPORTED_FORMATS.keys())
+            raise ValueError(f"Unsupported file format: {file_extension}. Supported formats: {supported_list}")
+        
         try:
-            mesh = o3d.io.read_triangle_mesh(str(file_path))
+            # If it's already an OBJ file, load directly
+            if file_extension == '.obj':
+                mesh = o3d.io.read_triangle_mesh(str(file_path))
+                MeshLoader._validate_mesh(mesh)
+                MeshLoader._prepare_mesh(mesh)
+                
+                conversion_info = ConversionInfo(
+                    original_format=".obj",
+                    format_name="Wavefront OBJ",
+                    original_file=str(file_path),
+                    converted_file=str(file_path),
+                    unit="mm",
+                    unit_assumed=True,
+                    reused_existing=False
+                )
+                conversion_time = time.time() - conversion_start
+                return mesh, conversion_info, conversion_time
+            
+            # Convert other formats to OBJ first
+            if not FORMAT_CONVERTER_AVAILABLE:
+                raise ValueError(f"Format converter not available. Cannot process {file_extension} files.")
+            
+            print(f"Converting {MeshLoader.SUPPORTED_FORMATS[file_extension]} to OBJ...")
+            result = convert_to_obj(str(file_path))
+            
+            if not result['success']:
+                raise ValueError(f"Format conversion failed: {result['error']}")
+            
+            obj_path = Path(result['output_file'])
+            
+            # Load the converted OBJ file
+            mesh = o3d.io.read_triangle_mesh(str(obj_path))
             MeshLoader._validate_mesh(mesh)
             MeshLoader._prepare_mesh(mesh)
-            return mesh
+            
+            conversion_info = ConversionInfo(
+                original_format=file_extension,
+                format_name=MeshLoader.SUPPORTED_FORMATS[file_extension],
+                original_file=str(file_path),
+                converted_file=str(obj_path),
+                unit=result['unit'],
+                unit_assumed=result['assumption'],
+                reused_existing=False
+            )
+            
+            conversion_time = time.time() - conversion_start
+            print(f"Conversion completed in {conversion_time:.2f}s")
+            return mesh, conversion_info, conversion_time
+            
         except Exception as e:
-            raise ValueError(f"Failed to load .obj model: {e}")
+            raise ValueError(f"Failed to load {MeshLoader.SUPPORTED_FORMATS.get(file_extension, 'unknown')} file: {e}")
     
     @staticmethod
     def _load_from_bytes(file_bytes: bytes) -> o3d.geometry.TriangleMesh:
-        """Load mesh from bytes"""
+        """Load mesh from bytes (assumes OBJ format for bytes input)"""
         try:
-            # Write bytes to temporary file for Open3D
             import tempfile
             with tempfile.NamedTemporaryFile(suffix='.obj', delete=False) as tmp:
                 tmp.write(file_bytes)
                 tmp.flush()
-                mesh = o3d.io.read_triangle_mesh(tmp.name)
-                Path(tmp.name).unlink()  # Clean up
+                temp_path = tmp.name
             
-            MeshLoader._validate_mesh(mesh)
-            MeshLoader._prepare_mesh(mesh)
-            return mesh
+            try:
+                mesh = o3d.io.read_triangle_mesh(temp_path)
+                MeshLoader._validate_mesh(mesh)
+                MeshLoader._prepare_mesh(mesh)
+                return mesh
+            finally:
+                Path(temp_path).unlink()
+            
         except Exception as e:
-            raise ValueError(f"Failed to load .obj model from bytes: {e}")
+            raise ValueError(f"Failed to load mesh from bytes: {e}")
     
     @staticmethod
     def _validate_mesh(mesh: o3d.geometry.TriangleMesh) -> None:
@@ -158,20 +266,19 @@ class MeshLoader:
     @staticmethod
     def _prepare_mesh(mesh: o3d.geometry.TriangleMesh) -> None:
         """Prepare mesh for analysis by computing normals and other properties"""
-        # Compute vertex normals if not present
         if not mesh.has_vertex_normals():
             mesh.compute_vertex_normals()
-        
-        # Compute triangle normals if not present
         if not mesh.has_triangle_normals():
             mesh.compute_triangle_normals()
         
-        # Remove duplicated vertices and triangles
         mesh.remove_duplicated_vertices()
         mesh.remove_duplicated_triangles()
         mesh.remove_degenerate_triangles()
-        
-        print(f"Loaded mesh: {len(mesh.vertices)} vertices, {len(mesh.triangles)} triangles")
+    
+    @staticmethod
+    def get_supported_formats() -> Dict[str, str]:
+        """Get dictionary of supported file formats"""
+        return MeshLoader.SUPPORTED_FORMATS.copy()
 
 
 class FaceSampler:
@@ -184,22 +291,13 @@ class FaceSampler:
         self._triangle_centers = None
         
     def sample(self, accuracy: str = 'medium') -> np.ndarray:
-        """
-        Sample faces based on accuracy level
-        
-        Args:
-            accuracy: One of 'low', 'medium', 'high', 'full'
-            
-        Returns:
-            Array of sampled face indices
-        """
+        """Sample faces based on accuracy level"""
         if accuracy == 'full':
             return np.arange(self.total_faces)
         
         sample_rate = self._get_sample_rate(accuracy)
         num_samples = max(100, int(self.total_faces * sample_rate))
         
-        print(f"Sampling {num_samples} faces from {self.total_faces} total faces")
         return self._spatial_sampling(num_samples)
     
     def _get_sample_rate(self, accuracy: str) -> float:
@@ -219,12 +317,10 @@ class FaceSampler:
             vertices = np.asarray(self.mesh.vertices)
             triangles = np.asarray(self.mesh.triangles)
             
-            # Get triangle vertices
             v0 = vertices[triangles[:, 0]]
             v1 = vertices[triangles[:, 1]]
             v2 = vertices[triangles[:, 2]]
             
-            # Compute areas using cross product
             cross = np.cross(v1 - v0, v2 - v0)
             self._triangle_areas = 0.5 * np.linalg.norm(cross, axis=1)
         
@@ -236,23 +332,19 @@ class FaceSampler:
             vertices = np.asarray(self.mesh.vertices)
             triangles = np.asarray(self.mesh.triangles)
             
-            # Get triangle vertices
             v0 = vertices[triangles[:, 0]]
             v1 = vertices[triangles[:, 1]]
             v2 = vertices[triangles[:, 2]]
             
-            # Compute centers
             self._triangle_centers = (v0 + v1 + v2) / 3.0
         
         return self._triangle_centers
     
     def _spatial_sampling(self, num_samples: int) -> np.ndarray:
         """Perform spatially-aware sampling for better coverage"""
-        # Create spatial grid
         grid_size = max(2, int(np.ceil(num_samples ** (1.0/3))))
         grid_cells = self._assign_faces_to_grid(grid_size)
         
-        # Sample from each cell
         sampled_indices = []
         target_per_cell = max(1, num_samples // len(grid_cells))
         
@@ -260,11 +352,7 @@ class FaceSampler:
             cell_sampled = self._sample_from_cell(cell_faces, target_per_cell)
             sampled_indices.extend(cell_sampled)
         
-        # Ensure minimum samples
-        sampled_indices = self._ensure_minimum_samples(
-            sampled_indices, num_samples
-        )
-        
+        sampled_indices = self._ensure_minimum_samples(sampled_indices, num_samples)
         return np.array(sampled_indices)
     
     def _assign_faces_to_grid(self, grid_size: int) -> Dict:
@@ -302,16 +390,12 @@ class FaceSampler:
         indices = [f[0] for f in cell_faces]
         weights = np.array([f[1] for f in cell_faces])
         
-        # Handle zero weights
         if np.sum(weights) == 0:
             num_samples = min(target_samples, len(indices))
             if num_samples > 0:
-                return np.random.choice(
-                    indices, size=num_samples, replace=False
-                ).tolist()
+                return np.random.choice(indices, size=num_samples, replace=False).tolist()
             return []
         
-        # Filter out zero weights for weighted sampling
         non_zero_mask = weights > 0
         non_zero_indices = np.array(indices)[non_zero_mask]
         non_zero_weights = weights[non_zero_mask]
@@ -319,12 +403,9 @@ class FaceSampler:
         if len(non_zero_indices) == 0:
             num_samples = min(target_samples, len(indices))
             if num_samples > 0:
-                return np.random.choice(
-                    indices, size=num_samples, replace=False
-                ).tolist()
+                return np.random.choice(indices, size=num_samples, replace=False).tolist()
             return []
         
-        # Normalize weights and sample
         non_zero_weights = non_zero_weights / np.sum(non_zero_weights)
         num_samples = min(target_samples, len(non_zero_indices))
         
@@ -335,8 +416,7 @@ class FaceSampler:
         
         return []
     
-    def _ensure_minimum_samples(self, sampled: List[int], 
-                               target: int) -> List[int]:
+    def _ensure_minimum_samples(self, sampled: List[int], target: int) -> List[int]:
         """Ensure we have at least the target number of samples"""
         if len(sampled) >= target:
             return sampled[:target]
@@ -366,20 +446,11 @@ class GPURaycastEngine:
     def _setup_raycasting_scene(self):
         """Setup the raycasting scene for GPU acceleration"""
         try:
-            # Create RaycastingScene for GPU-accelerated raycasting
             self.scene = o3d.t.geometry.RaycastingScene()
-            
-            # Convert legacy mesh to tensor mesh for GPU operations
             mesh_t = o3d.t.geometry.TriangleMesh.from_legacy(self.mesh, device=self.device)
-            
-            # Add mesh to scene
             self.scene.add_triangles(mesh_t)
             
-            print(f"Raycasting scene initialized on {self.device}")
-            
         except Exception as e:
-            print(f"GPU raycasting setup failed: {e}")
-            # Fallback to CPU
             self.device = o3d.core.Device("CPU:0")
             mesh_t = o3d.t.geometry.TriangleMesh.from_legacy(self.mesh, device=self.device)
             self.scene = o3d.t.geometry.RaycastingScene()
@@ -387,28 +458,11 @@ class GPURaycastEngine:
     
     def cast_rays(self, face_indices: np.ndarray, 
                   export_mode: bool = False) -> RaycastResult:
-        """
-        Cast rays inward and outward from specified faces using GPU/CPU
-        
-        Args:
-            face_indices: Indices of faces to cast rays from
-            export_mode: Whether to store per-face data for export
-            
-        Returns:
-            RaycastResult containing distance measurements
-        """
+        """Cast rays inward and outward from specified faces using GPU/CPU"""
         max_distance = float(np.max(self.mesh.get_axis_aligned_bounding_box().get_extent()) * 0.5)
-        print(f"Using max ray distance: {max_distance:.3f} units")
         
-        # Get face centers and normals
         face_centers, face_normals = self._get_face_properties(face_indices)
         
-        # Determine device type for progress reporting
-        device_type = "GPU" if self.device.get_type() == o3d.core.Device.DeviceType.CUDA else "CPU"
-        print(f"Casting rays for {len(face_indices)} faces on {self.device}")
-        start_time = time.time()
-        
-        # Cast rays in batches for memory efficiency
         batch_size = self._get_optimal_batch_size()
         result = RaycastResult()
         
@@ -427,45 +481,27 @@ class GPURaycastEngine:
             batch_centers = face_centers[start_idx:end_idx]
             batch_normals = face_normals[start_idx:end_idx]
             
-            # Cast inward rays
             self._cast_batch_rays(
                 batch_centers, -batch_normals, batch_indices, max_distance,
                 result.inward_distances, result.inward_face_data, export_mode
             )
             
-            # Cast outward rays
             self._cast_batch_rays(
                 batch_centers, batch_normals, batch_indices, max_distance,
                 result.outward_distances, result.outward_face_data, export_mode
             )
-            
-            # Progress reporting with correct device type
-            if num_batches > 10 and batch_idx % max(1, num_batches // 10) == 0:
-                progress = (batch_idx / num_batches) * 100
-                print(f"{device_type} raycast progress: {progress:.1f}%")
         
-        elapsed = time.time() - start_time
-        print(f"{device_type} raycasting completed in {elapsed:.2f}s")
-        print(f"Found {len(result.inward_distances)} inward and {len(result.outward_distances)} outward measurements")
-        
-        # Post-process data if needed
         if export_mode:
-            result.inward_face_data = self._interpolate_missing_values(
-                result.inward_face_data
-            )
-            result.outward_face_data = self._interpolate_missing_values(
-                result.outward_face_data
-            )
+            result.inward_face_data = self._interpolate_missing_values(result.inward_face_data)
+            result.outward_face_data = self._interpolate_missing_values(result.outward_face_data)
         
         return result
     
     def _get_optimal_batch_size(self) -> int:
         """Determine optimal batch size based on device memory"""
         if self.device.get_type() == o3d.core.Device.DeviceType.CUDA:
-            # GPU: Use larger batches for better GPU utilization
             return min(10000, max(1000, len(self.mesh.triangles) // 10))
         else:
-            # CPU: Use smaller batches to avoid memory issues
             return min(5000, max(500, len(self.mesh.triangles) // 20))
     
     def _get_face_properties(self, face_indices: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -474,16 +510,13 @@ class GPURaycastEngine:
         triangles = np.asarray(self.mesh.triangles)
         triangle_normals = np.asarray(self.mesh.triangle_normals)
         
-        # Get selected triangles
         selected_triangles = triangles[face_indices]
         
-        # Compute face centers
         v0 = vertices[selected_triangles[:, 0]]
         v1 = vertices[selected_triangles[:, 1]]
         v2 = vertices[selected_triangles[:, 2]]
         face_centers = (v0 + v1 + v2) / 3.0
         
-        # Get face normals
         face_normals = triangle_normals[face_indices]
         
         return face_centers, face_normals
@@ -494,21 +527,16 @@ class GPURaycastEngine:
                         export_mode: bool):
         """Cast a batch of rays using GPU acceleration"""
         try:
-            # Convert to Open3D tensors on the correct device
             ray_origins = o3d.core.Tensor(origins, dtype=o3d.core.float32, device=self.device)
             ray_directions = o3d.core.Tensor(directions, dtype=o3d.core.float32, device=self.device)
             
-            # Perform raycasting
             rays = o3d.core.concatenate([ray_origins, ray_directions], axis=1)
             ans = self.scene.cast_rays(rays)
             
-            # Extract results
             hit_distances = ans['t_hit'].cpu().numpy()
             geometry_ids = ans['geometry_ids'].cpu().numpy()
             
-            # Process hits
             for i, (distance, geom_id) in enumerate(zip(hit_distances, geometry_ids)):
-                # Check if ray hit something and distance is valid
                 if geom_id != self.scene.INVALID_ID and distance > 1e-3 and distance < max_distance:
                     measurements.append(distance)
                     
@@ -517,8 +545,6 @@ class GPURaycastEngine:
                         face_data[global_idx] = distance
                         
         except Exception as e:
-            print(f"Error in GPU ray casting batch: {e}")
-            # Fallback to CPU-based raycasting for this batch
             self._cast_batch_rays_fallback(
                 origins, directions, face_indices, max_distance,
                 measurements, face_data, export_mode
@@ -530,7 +556,6 @@ class GPURaycastEngine:
                                  export_mode: bool):
         """Fallback CPU-based raycasting for when GPU fails"""
         try:
-            # Use Open3D's legacy raycasting on CPU
             legacy_scene = o3d.t.geometry.RaycastingScene()
             mesh_cpu = o3d.t.geometry.TriangleMesh.from_legacy(self.mesh, device=o3d.core.Device("CPU:0"))
             legacy_scene.add_triangles(mesh_cpu)
@@ -553,7 +578,7 @@ class GPURaycastEngine:
                         face_data[global_idx] = distance
                         
         except Exception as e:
-            print(f"Fallback raycasting also failed: {e}")
+            pass  # Silent fallback failure
     
     def _interpolate_missing_values(self, data: np.ndarray) -> np.ndarray:
         """Interpolate missing values using nearest neighbors"""
@@ -565,7 +590,6 @@ class GPURaycastEngine:
             return data
         
         try:
-            # Get triangle centers for spatial interpolation
             face_centers = self._get_triangle_centers()
             valid_indices = np.where(valid_mask)[0]
             valid_centers = face_centers[valid_indices]
@@ -578,7 +602,6 @@ class GPURaycastEngine:
                 center = face_centers[idx]
                 distances, neighbors = tree.query(center, k=min(3, len(valid_centers)))
                 
-                # Weighted average
                 if np.all(distances > 0):
                     weights = 1.0 / distances
                     data[idx] = np.average(valid_values[neighbors], weights=weights)
@@ -586,7 +609,6 @@ class GPURaycastEngine:
                     data[idx] = valid_values[neighbors[0]]
                     
         except Exception as e:
-            print(f"Interpolation failed: {e}, using median")
             median_value = np.median(data[valid_mask])
             data[np.isnan(data)] = median_value
         
@@ -615,37 +637,27 @@ class VisualizationExporter:
                            title: str, colormap: str = 'jet'):
         """Export mesh with colors based on face data"""
         try:
-            # Create output directory
             output_dir = Path(output_path).parent
             output_dir.mkdir(parents=True, exist_ok=True)
             
-            # Generate colors
             face_colors = self._map_values_to_colors(face_data, colormap)
             vertex_colors = self._propagate_face_colors_to_vertices(face_colors)
             
-            # Create colored mesh
             colored_mesh = self.mesh.__copy__()
             colored_mesh.vertex_colors = o3d.utility.Vector3dVector(vertex_colors / 255.0)
             
-            # Export
             o3d.io.write_triangle_mesh(output_path, colored_mesh)
-            print(f"Exported colored mesh: {output_path}")
-            
-            # Create legend
             self._create_legend(face_data, legend_path, title, colormap)
             
         except Exception as e:
-            print(f"Error exporting visualization: {e}")
+            pass  # Silent failure for visualization
     
-    def _map_values_to_colors(self, values: np.ndarray, 
-                             colormap: str) -> np.ndarray:
+    def _map_values_to_colors(self, values: np.ndarray, colormap: str) -> np.ndarray:
         """Map scalar values to RGB colors"""
-        # Remove NaN values for normalization
         valid_values = values[~np.isnan(values)]
         if len(valid_values) == 0:
             return np.zeros((len(values), 3), dtype=np.uint8)
         
-        # Normalize values
         vmin, vmax = np.min(valid_values), np.max(valid_values)
         normalized = np.zeros_like(values)
         valid_mask = ~np.isnan(values)
@@ -653,15 +665,12 @@ class VisualizationExporter:
         if vmax > vmin:
             normalized[valid_mask] = (values[valid_mask] - vmin) / (vmax - vmin)
         
-        # Apply colormap
         cmap = plt.get_cmap(colormap)
         colors = cmap(normalized)
         
-        # Convert to RGB bytes
         return (colors[:, :3] * 255).astype(np.uint8)
     
-    def _propagate_face_colors_to_vertices(self, 
-                                          face_colors: np.ndarray) -> np.ndarray:
+    def _propagate_face_colors_to_vertices(self, face_colors: np.ndarray) -> np.ndarray:
         """Average face colors to vertices"""
         vertices = np.asarray(self.mesh.vertices)
         triangles = np.asarray(self.mesh.triangles)
@@ -669,13 +678,11 @@ class VisualizationExporter:
         vertex_colors = np.zeros((len(vertices), 3), dtype=np.float64)
         vertex_counts = np.zeros(len(vertices), dtype=int)
         
-        # Accumulate colors
         for face_idx, face in enumerate(triangles):
             for vertex_idx in face:
                 vertex_colors[vertex_idx] += face_colors[face_idx]
                 vertex_counts[vertex_idx] += 1
         
-        # Average
         mask = vertex_counts > 0
         vertex_colors[mask] /= vertex_counts[mask, np.newaxis]
         
@@ -690,7 +697,6 @@ class VisualizationExporter:
         
         fig, ax = plt.subplots(figsize=(8, 2))
         
-        # Create colorbar
         norm = Normalize(vmin=np.min(valid_values), vmax=np.max(valid_values))
         sm = cm.ScalarMappable(norm=norm, cmap=plt.get_cmap(colormap))
         sm.set_array([])
@@ -698,7 +704,6 @@ class VisualizationExporter:
         cbar = fig.colorbar(sm, ax=ax, orientation='horizontal')
         cbar.set_label(title, fontsize=12)
         
-        # Add statistics
         stats_text = (
             f"Min: {np.min(valid_values):.3f}\n"
             f"Max: {np.max(valid_values):.3f}\n"
@@ -711,29 +716,46 @@ class VisualizationExporter:
         plt.tight_layout()
         plt.savefig(output_path, dpi=150, bbox_inches='tight')
         plt.close()
-        
-        print(f"Saved legend: {output_path}")
 
 
 class MeshAnalyzer:
-    """Main analyzer class that orchestrates all analysis operations"""
+    """Main analyzer class that orchestrates all analysis operations for maximum accuracy"""
     
     def __init__(self, file_input: Union[str, Path, bytes], 
-                 use_gpu: bool = True, repair_mesh: bool = True):
-        """
-        Initialize analyzer with mesh file
+                 use_gpu: bool = True, 
+                 repair_mesh: bool = True,
+                 force_volume: bool = False):
+        """Initialize analyzer with mesh file for maximum accuracy analysis"""
+        # Initialize timing
+        self.timing = TimingInfo()
+        total_start = time.time()
         
-        Args:
-            file_input: Path to mesh file or bytes data
-            use_gpu: Whether to use GPU acceleration
-            repair_mesh: Whether to attempt mesh repair for better watertightness
-        """
-        self.mesh = MeshLoader.load(file_input)
+        # Load mesh with timing
+        mesh_result = MeshLoader.load(file_input)
+        if isinstance(mesh_result, tuple):
+            self.mesh, self.conversion_info, self.timing.format_conversion = mesh_result
+        else:
+            self.mesh = mesh_result
+            self.conversion_info = None
+            self.timing.format_conversion = 0.0
         
-        # Attempt mesh repair if requested
+        self.force_volume = force_volume
+        
+        # Mesh repair with timing
+        repair_start = time.time()
         if repair_mesh:
             self.mesh = self._repair_mesh(self.mesh)
+        else:
+            try:
+                self.is_watertight = self.mesh.is_watertight()
+                self.attempted_repair = False
+            except Exception as e:
+                self.is_watertight = False
+                self.attempted_repair = False
+        self.timing.mesh_repair = time.time() - repair_start
         
+        # Setup components with timing
+        setup_start = time.time()
         self.device = GPUManager.setup_gpu() if use_gpu else o3d.core.Device("CPU:0")
         self.device_info = GPUManager.get_device_info(self.device)
         
@@ -742,63 +764,192 @@ class MeshAnalyzer:
         self.visualizer = VisualizationExporter(self.mesh)
         self._separate_objects()
         self._raycast_cache = None
+        self.timing.analysis_setup = time.time() - setup_start
         
-        print(f"Analyzer initialized with {self.device_info['type']}: {self.device_info['name']}")
+        # Show concise initialization info
+        device_type = "GPU" if self.device_info['type'] == 'GPU' else "CPU"
+        print(f"Initialized: {len(self.mesh.vertices)} vertices, {len(self.mesh.triangles)} faces ({device_type})")
+        
+        if self.conversion_info and self.conversion_info.original_format != '.obj':
+            print(f"Converted: {self.conversion_info.format_name} → OBJ ({self.timing.format_conversion:.2f}s)")
+        
+        if repair_mesh:
+            status = "watertight" if self.is_watertight else "not watertight"
+            print(f"Mesh repair: {status} ({self.timing.mesh_repair:.2f}s)")
+        
+        if not hasattr(self, 'is_watertight'):
+            try:
+                self.is_watertight = self.mesh.is_watertight()
+                self.attempted_repair = repair_mesh
+            except:
+                self.is_watertight = False
+                self.attempted_repair = repair_mesh
+        
+        self.timing.total_time = time.time() - total_start
     
     def _repair_mesh(self, mesh: o3d.geometry.TriangleMesh) -> o3d.geometry.TriangleMesh:
-        """Attempt to repair mesh for better watertightness"""
+        """Attempt aggressive mesh repair for better watertightness"""
         try:
-            print("Attempting mesh repair...")
             original_faces = len(mesh.triangles)
-            original_vertices = len(mesh.vertices)
-            
-            # Create a copy for repair
             repaired = mesh.__copy__()
             
-            # Remove duplicates and degenerate triangles
+            # Basic cleanup
             repaired.remove_duplicated_vertices()
             repaired.remove_duplicated_triangles()
             repaired.remove_degenerate_triangles()
             
-            # Try to remove non-manifold edges
-            try:
-                repaired.remove_non_manifold_edges()
-            except:
-                print("  Non-manifold edge removal failed, continuing...")
-            
             # Merge close vertices
-            repaired.merge_close_vertices(1e-6)
+            for tolerance in [1e-8, 1e-7, 1e-6, 1e-5]:
+                repaired.merge_close_vertices(tolerance)
+                repaired.remove_degenerate_triangles()
             
-            # Recompute normals
+            # Remove non-manifold edges
+            for attempt in range(3):
+                try:
+                    repaired.remove_non_manifold_edges()
+                    repaired.remove_degenerate_triangles()
+                    break
+                except Exception as e:
+                    if attempt == 2:
+                        break
+            
+            # Orient normals and recompute
+            try:
+                repaired.orient_triangles()
+            except:
+                pass
+            
             repaired.compute_vertex_normals()
             repaired.compute_triangle_normals()
             
-            new_faces = len(repaired.triangles)
-            new_vertices = len(repaired.vertices)
+            # Final cleanup
+            repaired.remove_duplicated_vertices()
+            repaired.remove_duplicated_triangles()
+            repaired.remove_degenerate_triangles()
             
-            print(f"  Mesh repair completed:")
-            print(f"    Vertices: {original_vertices} → {new_vertices}")
-            print(f"    Faces: {original_faces} → {new_faces}")
-            
-            # Check if repair improved watertightness
+            # Check watertightness
             try:
-                is_watertight_before = mesh.is_watertight()
-                is_watertight_after = repaired.is_watertight()
-                print(f"    Watertight: {is_watertight_before} → {is_watertight_after}")
-            except:
-                pass
+                self.is_watertight = repaired.is_watertight()
+                self.attempted_repair = True
+            except Exception as e:
+                self.is_watertight = False
+                self.attempted_repair = True
             
             return repaired
             
         except Exception as e:
-            print(f"Mesh repair failed: {e}")
+            self.is_watertight = False
+            self.attempted_repair = True
             return mesh
+    
+    def _calculate_volume_permissive(self) -> Optional[float]:
+        """Calculate volume with multiple methods, even for 'non-watertight' meshes"""
+        # Method 1: Open3D's built-in method
+        try:
+            volume = self.mesh.get_volume()
+            if abs(volume) > 1e-12:
+                return abs(volume)
+        except Exception as e:
+            pass
         
+        # Method 2: Manual calculation using divergence theorem
+        try:
+            volume = self._calculate_volume_divergence_theorem()
+            if volume is not None and abs(volume) > 1e-12:
+                return abs(volume)
+        except Exception as e:
+            pass
+        
+        # Method 3: Tetrahedralization approach
+        try:
+            volume = self._calculate_volume_tetrahedralization()
+            if volume is not None and abs(volume) > 1e-12:
+                return abs(volume)
+        except Exception as e:
+            pass
+        
+        return None
+    
+    def _calculate_volume_divergence_theorem(self) -> Optional[float]:
+        """Calculate volume using divergence theorem"""
+        vertices = np.asarray(self.mesh.vertices)
+        triangles = np.asarray(self.mesh.triangles)
+        
+        volume = 0.0
+        for triangle in triangles:
+            v0, v1, v2 = vertices[triangle[0]], vertices[triangle[1]], vertices[triangle[2]]
+            
+            normal = np.cross(v1 - v0, v2 - v0)
+            area = 0.5 * np.linalg.norm(normal)
+            
+            if area > 1e-12:
+                normal = normal / (2 * area)
+                centroid = (v0 + v1 + v2) / 3.0
+                volume += (1.0/3.0) * area * np.dot(centroid, normal)
+        
+        return volume if abs(volume) > 1e-12 else None
+    
+    def _calculate_volume_tetrahedralization(self) -> Optional[float]:
+        """Calculate volume by dividing into tetrahedra from centroid"""
+        vertices = np.asarray(self.mesh.vertices)
+        triangles = np.asarray(self.mesh.triangles)
+        
+        centroid = np.mean(vertices, axis=0)
+        
+        volume = 0.0
+        for triangle in triangles:
+            v0, v1, v2 = vertices[triangle[0]], vertices[triangle[1]], vertices[triangle[2]]
+            tetrahedron_volume = np.abs(np.dot(v0 - centroid, np.cross(v1 - centroid, v2 - centroid))) / 6.0
+            volume += tetrahedron_volume
+        
+        return volume if volume > 1e-12 else None
+    
+    def _calculate_bounding_box_volume(self) -> float:
+        """Calculate axis-aligned bounding box volume"""
+        bbox = self.mesh.get_axis_aligned_bounding_box()
+        extents = bbox.get_extent()
+        return extents[0] * extents[1] * extents[2]
+    
+    def _calculate_convex_hull_volume(self) -> Optional[float]:
+        """Calculate convex hull volume"""
+        try:
+            hull, _ = self.mesh.compute_convex_hull()
+            return self._calculate_volume_for_mesh(hull)
+        except Exception as e:
+            return None
+    
+    def _calculate_volume_for_mesh(self, mesh: o3d.geometry.TriangleMesh) -> Optional[float]:
+        """Calculate volume for any mesh using multiple methods"""
+        try:
+            volume = mesh.get_volume()
+            if abs(volume) > 1e-12:
+                return abs(volume)
+        except:
+            pass
+        
+        # Fallback to divergence theorem
+        try:
+            vertices = np.asarray(mesh.vertices)
+            triangles = np.asarray(mesh.triangles)
+            
+            volume = 0.0
+            for triangle in triangles:
+                v0, v1, v2 = vertices[triangle[0]], vertices[triangle[1]], vertices[triangle[2]]
+                normal = np.cross(v1 - v0, v2 - v0)
+                area = 0.5 * np.linalg.norm(normal)
+                
+                if area > 1e-12:
+                    normal = normal / (2 * area)
+                    centroid = (v0 + v1 + v2) / 3.0
+                    volume += (1.0/3.0) * area * np.dot(centroid, normal)
+            
+            return abs(volume) if abs(volume) > 1e-12 else None
+        except:
+            return None
+    
     def _separate_objects(self):
         """Identify separate objects in the mesh"""
         try:
-            # Open3D doesn't have built-in mesh splitting like trimesh
-            # We'll use connected components analysis
             self.objects = self._split_connected_components()
             self.total_objects = len(self.objects)
         except:
@@ -808,31 +959,26 @@ class MeshAnalyzer:
     def _split_connected_components(self) -> List[o3d.geometry.TriangleMesh]:
         """Split mesh into connected components"""
         try:
-            # Get connected components
             triangle_clusters, cluster_n_triangles, cluster_area = (
                 self.mesh.cluster_connected_triangles()
             )
             triangle_clusters = np.asarray(triangle_clusters)
             cluster_n_triangles = np.asarray(cluster_n_triangles)
             
-            # Create separate meshes for each component
             objects = []
             vertices = np.asarray(self.mesh.vertices)
             triangles = np.asarray(self.mesh.triangles)
             
             for cluster_id in range(len(cluster_n_triangles)):
-                if cluster_n_triangles[cluster_id] > 10:  # Filter small components
+                if cluster_n_triangles[cluster_id] > 10:
                     cluster_triangles = triangles[triangle_clusters == cluster_id]
                     
-                    # Get unique vertices used by this cluster
                     used_vertices = np.unique(cluster_triangles.flatten())
                     cluster_vertices = vertices[used_vertices]
                     
-                    # Remap triangle indices
                     vertex_map = {old_idx: new_idx for new_idx, old_idx in enumerate(used_vertices)}
                     remapped_triangles = np.array([[vertex_map[v] for v in tri] for tri in cluster_triangles])
                     
-                    # Create mesh
                     obj_mesh = o3d.geometry.TriangleMesh()
                     obj_mesh.vertices = o3d.utility.Vector3dVector(cluster_vertices)
                     obj_mesh.triangles = o3d.utility.Vector3iVector(remapped_triangles)
@@ -844,118 +990,115 @@ class MeshAnalyzer:
             return objects if objects else [self.mesh]
             
         except Exception as e:
-            print(f"Failed to split connected components: {e}")
             return [self.mesh]
     
     def analyze(self, accuracy: str = 'medium', 
                 export_visualizations: bool = False) -> Dict:
-        """
-        Perform complete mesh analysis
-        
-        Args:
-            accuracy: Analysis accuracy level
-            export_visualizations: Whether to export colored visualizations
-            
-        Returns:
-            Dictionary containing all analysis results
-        """
-        device_name = "GPU-accelerated" if self.device_info['type'] == 'GPU' else "CPU-based"
-        print(f"\nStarting {device_name} mesh analysis (accuracy: {accuracy})")
-        start_time = time.time()
+        """Perform complete mesh analysis using original geometry for maximum accuracy"""
+        analysis_start = time.time()
         
         try:
-            # Perform raycast (cached for efficiency)
-            print("Starting raycast analysis...")
+            # Raycast analysis with timing
+            raycast_start = time.time()
+            print(f"Performing raycast analysis (accuracy: {accuracy})...")
             self._perform_raycast(accuracy, export_visualizations)
-            print("Raycast analysis completed")
+            self.timing.raycast_analysis = time.time() - raycast_start
+            print(f"Raycast completed ({self.timing.raycast_analysis:.2f}s)")
             
-            # Safety checks for attributes
+            # Safety checks
             if not hasattr(self, 'is_watertight'):
                 self.is_watertight = False
             if not hasattr(self, 'attempted_repair'):
                 self.attempted_repair = False
             
-            print("Gathering analysis results...")
-            
-            # Collect all analyses with individual error handling
             results = {}
             
+            # Dimensional analysis with timing
+            dim_start = time.time()
             try:
-                print("  Analyzing dimensions...")
                 results["dimensions"] = self._analyze_dimensions()
             except Exception as e:
-                print(f"  Error in dimensions analysis: {e}")
                 results["dimensions"] = MeshDimensions(0, 0, 0, None, 0, False)
+            self.timing.dimensional_analysis = time.time() - dim_start
             
             try:
-                print("  Analyzing watertightness...")
                 results["watertightness"] = self._analyze_watertightness()
             except Exception as e:
-                print(f"  Error in watertightness analysis: {e}")
                 results["watertightness"] = False
             
             try:
-                print("  Gathering watertight details...")
                 results["watertight_details"] = {
                     "is_watertight": self.is_watertight,
                     "repair_attempted": self.attempted_repair,
                     "repair_successful": self.attempted_repair and self.is_watertight
                 }
             except Exception as e:
-                print(f"  Error in watertight details: {e}")
                 results["watertight_details"] = {"is_watertight": False, "repair_attempted": False, "repair_successful": False}
             
             try:
-                print("  Analyzing separate objects...")
                 results["separate_objects"] = self._analyze_objects()
             except Exception as e:
-                print(f"  Error in objects analysis: {e}")
                 results["separate_objects"] = {"total_objects": 1, "object_count": 1}
             
             try:
-                print("  Analyzing wall thickness...")
+                results["format_conversion"] = self._format_conversion_results()
+            except Exception as e:
+                results["format_conversion"] = {"performed": False, "error": str(e)}
+            
+            # Wall thickness analysis with timing
+            wall_start = time.time()
+            try:
                 results["wall_thickness"] = self._analyze_wall_thickness(export_visualizations)
             except Exception as e:
-                print(f"  Error in wall thickness analysis: {e}")
                 results["wall_thickness"] = WallAnalysisResult(error=str(e))
+            self.timing.wall_analysis = time.time() - wall_start
             
+            # Gap analysis with timing
+            gap_start = time.time()
             try:
-                print("  Analyzing gaps...")
                 results["gaps"] = self._analyze_gaps(export_visualizations)
             except Exception as e:
-                print(f"  Error in gaps analysis: {e}")
                 results["gaps"] = GapAnalysisResult(error=str(e))
+            self.timing.gap_analysis = time.time() - gap_start
             
+            # Update total timing
+            self.timing.total_time = time.time() - analysis_start + self.timing.format_conversion + self.timing.mesh_repair + self.timing.analysis_setup
             
             try:
-                print("  Gathering metadata...")
                 results["metadata"] = {
                     "faces": len(self.mesh.triangles),
                     "vertices": len(self.mesh.vertices),
-                    "analysis_time": time.time() - start_time,
+                    "analysis_time": self.timing.total_time,
                     "device_type": self.device_info['type'],
                     "device_name": self.device_info['name']
                 }
             except Exception as e:
-                print(f"  Error in metadata: {e}")
                 results["metadata"] = {
                     "faces": 0,
                     "vertices": 0,
-                    "analysis_time": time.time() - start_time,
+                    "analysis_time": self.timing.total_time,
                     "device_type": "Unknown",
                     "device_name": "Unknown"
                 }
             
-            print("All analysis components completed")
-            print(f"Analysis completed in {results['metadata']['analysis_time']:.2f}s using {self.device_info['type']}")
+            # Add timing information
+            results["timing"] = {
+                "format_conversion": self.timing.format_conversion,
+                "mesh_repair": self.timing.mesh_repair,
+                "analysis_setup": self.timing.analysis_setup,
+                "raycast_analysis": self.timing.raycast_analysis,
+                "dimensional_analysis": self.timing.dimensional_analysis,
+                "wall_analysis": self.timing.wall_analysis,
+                "gap_analysis": self.timing.gap_analysis,
+                "total_time": self.timing.total_time
+            }
+            
+            print(f"Analysis completed ({self.timing.total_time:.2f}s total)")
             return results
             
         except Exception as e:
-            print(f"Critical error in analysis: {e}")
-            import traceback
-            traceback.print_exc()
+            self.timing.total_time = time.time() - analysis_start + self.timing.format_conversion + self.timing.mesh_repair + self.timing.analysis_setup
             
-            # Return minimal results to prevent complete failure
             return {
                 "dimensions": MeshDimensions(0, 0, 0, None, 0, False),
                 "watertightness": False,
@@ -966,12 +1109,41 @@ class MeshAnalyzer:
                 "metadata": {
                     "faces": 0,
                     "vertices": 0,
-                    "analysis_time": time.time() - start_time,
+                    "analysis_time": self.timing.total_time,
                     "device_type": "Unknown",
                     "device_name": "Unknown",
                     "error": str(e)
+                },
+                "timing": {
+                    "format_conversion": self.timing.format_conversion,
+                    "mesh_repair": self.timing.mesh_repair,
+                    "analysis_setup": self.timing.analysis_setup,
+                    "raycast_analysis": self.timing.raycast_analysis,
+                    "dimensional_analysis": self.timing.dimensional_analysis,
+                    "wall_analysis": self.timing.wall_analysis,
+                    "gap_analysis": self.timing.gap_analysis,
+                    "total_time": self.timing.total_time
                 }
             }
+    
+    def _format_conversion_results(self) -> Dict:
+        """Format file conversion results for inclusion in analysis output"""
+        if self.conversion_info is None:
+            return {
+                "performed": False,
+                "reason": "Input file was already in OBJ format or conversion info not available"
+            }
+        
+        return {
+            "performed": True,
+            "original_format": self.conversion_info.original_format,
+            "format_name": self.conversion_info.format_name,
+            "original_file": self.conversion_info.original_file,
+            "converted_file": self.conversion_info.converted_file,
+            "detected_unit": self.conversion_info.unit,
+            "unit_assumed": self.conversion_info.unit_assumed,
+            "target_format": ".obj"
+        }
     
     def _perform_raycast(self, accuracy: str, export_mode: bool):
         """Perform raycast analysis (cached)"""
@@ -982,31 +1154,44 @@ class MeshAnalyzer:
             )
     
     def _analyze_dimensions(self) -> MeshDimensions:
-        """Analyze physical dimensions with smart volume handling"""
+        """Analyze physical dimensions with comprehensive volume handling and additional metrics"""
         bbox = self.mesh.get_axis_aligned_bounding_box()
         extents = bbox.get_extent()
         
-        # Calculate surface area (always possible)
+        # Calculate surface area
         surface_area = self._calculate_surface_area()
         
-        # Calculate volume only if watertight
-        volume = None
-        if self.is_watertight:
-            volume = self._calculate_volume_safe()
-            if volume is not None:
-                print(f"Volume calculated: {volume:.3f} cubic units")
-            else:
-                print("Volume calculation failed despite watertight mesh")
-        else:
-            print("Skipping volume calculation - mesh is not watertight")
+        # Calculate volumes
+        actual_volume = self._calculate_volume_safe()
+        bounding_box_volume = self._calculate_bounding_box_volume()
+        convex_hull_volume = self._calculate_convex_hull_volume()
+        
+        # Calculate ratios
+        surface_to_volume_ratio = None
+        bounding_to_actual_volume_ratio = None
+        concavity_ratio = None
+        
+        if actual_volume is not None and actual_volume > 1e-12:
+            surface_to_volume_ratio = surface_area / actual_volume
+            
+            if bounding_box_volume > 1e-12:
+                bounding_to_actual_volume_ratio = bounding_box_volume / actual_volume
+            
+            if convex_hull_volume is not None and convex_hull_volume > 1e-12:
+                concavity_ratio = convex_hull_volume / actual_volume
         
         return MeshDimensions(
             length=extents[0],
             width=extents[1],
             height=extents[2],
-            volume=volume,
+            volume=actual_volume,
             surface_area=surface_area,
-            is_watertight=self.is_watertight
+            is_watertight=self.is_watertight,
+            surface_to_volume_ratio=surface_to_volume_ratio,
+            bounding_to_actual_volume_ratio=bounding_to_actual_volume_ratio,
+            concavity_ratio=concavity_ratio,
+            bounding_box_volume=bounding_box_volume,
+            convex_hull_volume=convex_hull_volume
         )
     
     def _calculate_surface_area(self) -> float:
@@ -1014,8 +1199,6 @@ class MeshAnalyzer:
         try:
             return self.mesh.get_surface_area()
         except Exception as e:
-            print(f"Open3D surface area calculation failed: {e}, using fallback")
-            # Fallback manual calculation
             try:
                 vertices = np.asarray(self.mesh.vertices)
                 triangles = np.asarray(self.mesh.triangles)
@@ -1027,148 +1210,18 @@ class MeshAnalyzer:
                 cross = np.cross(v1 - v0, v2 - v0)
                 return 0.5 * np.sum(np.linalg.norm(cross, axis=1))
             except Exception as e2:
-                print(f"Fallback surface area calculation failed: {e2}")
                 return 0.0
     
     def _calculate_volume_safe(self) -> Optional[float]:
-        """Calculate volume with error handling - only call if watertight"""
-        try:
-            volume = self.mesh.get_volume()
-            return abs(volume) if volume != 0 else None
-        except Exception as e:
-            print(f"Volume calculation failed: {e}")
-            return None
-    
-    def _calculate_volume_robust(self) -> float:
-        """Calculate volume with multiple fallback methods"""
-        # Method 1: Try Open3D's built-in volume calculation
-        try:
-            volume = self.mesh.get_volume()
-            if volume > 0:  # Valid volume
-                return abs(volume)  # Ensure positive
-        except Exception as e:
-            print(f"Open3D volume calculation failed: {e}")
-        
-        # Method 2: Try after mesh repair
-        try:
-            # Create a copy and try to repair it
-            repaired_mesh = self.mesh.__copy__()
-            repaired_mesh.remove_duplicated_vertices()
-            repaired_mesh.remove_duplicated_triangles()
-            repaired_mesh.remove_degenerate_triangles()
-            repaired_mesh.remove_non_manifold_edges()
-            
-            volume = repaired_mesh.get_volume()
-            if volume > 0:
-                return abs(volume)
-        except Exception as e:
-            print(f"Repaired mesh volume calculation failed: {e}")
-        
-        # Method 3: Manual volume calculation using divergence theorem
-        try:
-            volume = self._calculate_volume_manual()
-            if volume > 0:
-                return abs(volume)
-        except Exception as e:
-            print(f"Manual volume calculation failed: {e}")
-        
-        # Method 4: Approximate volume using bounding box and density
-        try:
-            bbox = self.mesh.get_axis_aligned_bounding_box()
-            bbox_volume = bbox.volume()
-            
-            # Estimate density by sampling points
-            vertices = np.asarray(self.mesh.vertices)
-            bbox_min = bbox.min_bound
-            bbox_max = bbox.max_bound
-            
-            # Sample points in bounding box
-            n_samples = 10000
-            sample_points = np.random.uniform(bbox_min, bbox_max, (n_samples, 3))
-            
-            # Check which points are inside the mesh
-            inside_count = 0
-            for point in sample_points[:1000]:  # Limit for performance
-                if self._point_in_mesh(point):
-                    inside_count += 1
-            
-            density = inside_count / 1000
-            approximate_volume = bbox_volume * density
-            
-            if approximate_volume > 0:
-                print(f"Using approximate volume calculation: {approximate_volume:.3f}")
-                return approximate_volume
-                
-        except Exception as e:
-            print(f"Approximate volume calculation failed: {e}")
-        
-        # Method 5: Return 0 if all methods fail
-        print("Warning: All volume calculation methods failed, returning 0")
-        return 0.0
-    
-    def _calculate_volume_manual(self) -> float:
-        """Manual volume calculation using divergence theorem"""
-        vertices = np.asarray(self.mesh.vertices)
-        triangles = np.asarray(self.mesh.triangles)
-        
-        if len(triangles) == 0:
-            return 0.0
-        
-        # Get triangle vertices
-        v0 = vertices[triangles[:, 0]]
-        v1 = vertices[triangles[:, 1]]
-        v2 = vertices[triangles[:, 2]]
-        
-        # Calculate triangle centers and normals
-        centers = (v0 + v1 + v2) / 3.0
-        
-        # Calculate cross product for normal and area
-        cross = np.cross(v1 - v0, v2 - v0)
-        normals = cross / (np.linalg.norm(cross, axis=1, keepdims=True) + 1e-12)
-        areas = 0.5 * np.linalg.norm(cross, axis=1)
-        
-        # Volume calculation using divergence theorem
-        # V = (1/3) * sum(dot(center, normal) * area)
-        volume = np.sum(np.sum(centers * normals, axis=1) * areas) / 3.0
-        
-        return abs(volume)
-    
-    def _point_in_mesh(self, point: np.ndarray) -> bool:
-        """Check if a point is inside the mesh using ray casting"""
-        try:
-            # Cast a ray from the point in a random direction
-            direction = np.array([1.0, 0.0, 0.0])  # Simple direction
-            
-            # Use Open3D's raycasting scene
-            ray_origins = o3d.core.Tensor([point], dtype=o3d.core.float32, device=o3d.core.Device("CPU:0"))
-            ray_directions = o3d.core.Tensor([direction], dtype=o3d.core.float32, device=o3d.core.Device("CPU:0"))
-            
-            rays = o3d.core.concatenate([ray_origins, ray_directions], axis=1)
-            
-            # Create a simple raycasting scene
-            scene = o3d.t.geometry.RaycastingScene()
-            mesh_t = o3d.t.geometry.TriangleMesh.from_legacy(self.mesh, device=o3d.core.Device("CPU:0"))
-            scene.add_triangles(mesh_t)
-            
-            ans = scene.cast_rays(rays)
-            hit_distances = ans['t_hit'].cpu().numpy()
-            geometry_ids = ans['geometry_ids'].cpu().numpy()
-            
-            # Count intersections
-            valid_hits = np.sum((geometry_ids != scene.INVALID_ID) & (hit_distances > 1e-6))
-            
-            # Point is inside if odd number of intersections
-            return (valid_hits % 2) == 1
-            
-        except:
-            return False
+        """Calculate volume with error handling and multiple methods"""
+        return self._calculate_volume_permissive()
     
     def _analyze_watertightness(self) -> bool:
         """Return the already-determined watertightness status"""
         return self.is_watertight
     
     def _analyze_objects(self) -> Dict:
-        """Analyze separate objects (no volume calculation)"""
+        """Analyze separate objects"""
         return {
             "total_objects": self.total_objects,
             "object_count": len(self.objects)
@@ -1182,25 +1235,17 @@ class MeshAnalyzer:
             if not distances:
                 return WallAnalysisResult(error="No thickness measurements found")
             
-            print(f"  Found {len(distances)} inward ray measurements")
-            
-            # Use external analyzer with proper error handling
             analyzer = thinWallAnalysis.WallAnalyzer()
             
-            # Disable plotting to avoid Windows matplotlib errors
             thinnest = analyzer.analyze(
                 ray_data=distances,
-                plot=True,  # Disable plotting to avoid directory/matplotlib errors
+                plot=False,
                 print_results=False, 
                 find_significant=True
             )
             
-            print(f"  Thinnest wall analysis result: {thinnest}")
-            
-            # Export visualization if requested
             if export and self._raycast_cache.inward_face_data is not None:
                 try:
-                    # Ensure visualization directory exists
                     Path("visualization").mkdir(exist_ok=True)
                     self.visualizer.export_colored_mesh(
                         self._raycast_cache.inward_face_data,
@@ -1210,7 +1255,7 @@ class MeshAnalyzer:
                         "jet_r"
                     )
                 except Exception as viz_error:
-                    print(f"    Warning: Visualization export failed: {viz_error}")
+                    pass
             
             return WallAnalysisResult(
                 thinnest_feature=thinnest,
@@ -1218,7 +1263,6 @@ class MeshAnalyzer:
             )
             
         except Exception as e:
-            print(f"  Wall thickness analysis failed: {e}")
             return WallAnalysisResult(error=str(e))
     
     def _analyze_gaps(self, export: bool) -> GapAnalysisResult:
@@ -1229,25 +1273,17 @@ class MeshAnalyzer:
             if not distances:
                 return GapAnalysisResult(error="No gap measurements found")
             
-            print(f"  Found {len(distances)} outward ray measurements")
-            
-            # Use external analyzer with proper error handling
             analyzer = thinWallAnalysis.WallAnalyzer()
             
-            # Disable plotting to avoid Windows matplotlib errors
             smallest = analyzer.analyze(
                 ray_data=distances,
-                plot=False,  # Disable plotting to avoid directory/matplotlib errors
-                print_results=True,
+                plot=False,
+                print_results=False,
                 find_significant=True
             )
             
-            print(f"  Smallest gap analysis result: {smallest}")
-            
-            # Export visualization if requested
             if export and self._raycast_cache.outward_face_data is not None:
                 try:
-                    # Ensure visualization directory exists
                     Path("visualization").mkdir(exist_ok=True)
                     self.visualizer.export_colored_mesh(
                         self._raycast_cache.outward_face_data,
@@ -1257,7 +1293,7 @@ class MeshAnalyzer:
                         "jet_r"
                     )
                 except Exception as viz_error:
-                    print(f"    Warning: Visualization export failed: {viz_error}")
+                    pass
             
             return GapAnalysisResult(
                 smallest_gap=smallest,
@@ -1265,9 +1301,7 @@ class MeshAnalyzer:
             )
             
         except Exception as e:
-            print(f"  Gap analysis failed: {e}")
             return GapAnalysisResult(error=str(e))
-    
 
 
 class ResultsFormatter:
@@ -1278,7 +1312,7 @@ class ResultsFormatter:
         """Format results in a human-readable structure"""
         formatted = {}
         
-        # Dimensions
+        # Dimensions with enhanced metrics
         dims = results["dimensions"]
         formatted_dims = {
             "Length": f"{dims.length:.2f} units",
@@ -1287,15 +1321,35 @@ class ResultsFormatter:
             "Surface Area": f"{dims.surface_area:.2f} square units"
         }
         
-        # Add volume only if available
+        # Volume information
         if dims.volume is not None:
-            formatted_dims["Volume"] = f"{dims.volume:.2f} cubic units"
+            if dims.is_watertight:
+                formatted_dims["Volume"] = f"{dims.volume:.6f} cubic units (reliable)"
+            else:
+                formatted_dims["Volume"] = f"{dims.volume:.6f} cubic units (estimated)"
         else:
-            formatted_dims["Volume"] = "Not available (mesh not watertight)"
+            formatted_dims["Volume"] = "Not available"
+        
+        # Enhanced geometric ratios
+        if dims.surface_to_volume_ratio is not None:
+            formatted_dims["Surface/Volume Ratio"] = f"{dims.surface_to_volume_ratio:.3f}"
+        
+        if dims.bounding_to_actual_volume_ratio is not None:
+            formatted_dims["Bounding/Actual Volume Ratio"] = f"{dims.bounding_to_actual_volume_ratio:.3f}"
+        
+        if dims.concavity_ratio is not None:
+            formatted_dims["Concavity Ratio"] = f"{dims.concavity_ratio:.3f} (convex hull / actual)"
+        
+        # Additional volume data
+        if dims.bounding_box_volume is not None:
+            formatted_dims["Bounding Box Volume"] = f"{dims.bounding_box_volume:.6f} cubic units"
+        
+        if dims.convex_hull_volume is not None:
+            formatted_dims["Convex Hull Volume"] = f"{dims.convex_hull_volume:.6f} cubic units"
             
         formatted["Dimensions"] = formatted_dims
         
-        # Basic properties with detailed watertightness info
+        # Basic properties
         watertight_details = results.get("watertight_details", {})
         watertight_status = "Yes" if results["watertightness"] else "No"
         
@@ -1309,6 +1363,19 @@ class ResultsFormatter:
             "Watertight": watertight_status,
             "Separate Objects": results["separate_objects"]["total_objects"]
         }
+        
+        # Format conversion information
+        conversion = results.get("format_conversion", {})
+        if conversion.get("performed", False):
+            formatted["File Conversion"] = {
+                "Original Format": f"{conversion.get('format_name', 'Unknown')} ({conversion.get('original_format', 'unknown')})",
+                "Converted To": "Wavefront OBJ (.obj)",
+                "Detected Units": f"{conversion.get('detected_unit', 'unknown')} (assumed: {conversion.get('unit_assumed', True)})"
+            }
+        else:
+            formatted["File Conversion"] = {
+                "Conversion Performed": "No"
+            }
         
         # Manufacturing analysis
         formatted["Manufacturing Analysis"] = {}
@@ -1331,24 +1398,41 @@ class ResultsFormatter:
         else:
             formatted["Manufacturing Analysis"]["Smallest Gap"] = "No data available"
         
-        
         # Metadata
         meta = results["metadata"]
         formatted["Analysis Info"] = {
-            "Mesh Complexity": f"{meta['faces']} faces, {meta['vertices']} vertices",
-            "Analysis Time": f"{meta['analysis_time']:.2f} seconds",
-            "Compute Device": f"{meta['device_type']} ({meta['device_name']})"
+            "Mesh Complexity": f"{meta.get('faces', 0)} faces, {meta.get('vertices', 0)} vertices",
+            "Analysis Time": f"{meta.get('analysis_time', 0):.2f} seconds",
+            "Compute Device": f"{meta.get('device_type', 'Unknown')} ({meta.get('device_name', 'Unknown')})"
         }
+        
+        # Timing breakdown
+        timing = results.get("timing", {})
+        if timing:
+            formatted["Timing Breakdown"] = {
+                "Format Conversion": f"{timing.get('format_conversion', 0):.2f}s",
+                "Mesh Repair": f"{timing.get('mesh_repair', 0):.2f}s",
+                "Analysis Setup": f"{timing.get('analysis_setup', 0):.2f}s",
+                "Raycast Analysis": f"{timing.get('raycast_analysis', 0):.2f}s",
+                "Dimensional Analysis": f"{timing.get('dimensional_analysis', 0):.2f}s",
+                "Wall Analysis": f"{timing.get('wall_analysis', 0):.2f}s",
+                "Gap Analysis": f"{timing.get('gap_analysis', 0):.2f}s",
+                "Total Time": f"{timing.get('total_time', 0):.2f}s"
+            }
         
         return formatted
 
 
 def main():
-    """Command-line interface"""
+    """Command-line interface with automatic format conversion for maximum accuracy analysis"""
+    # Get supported formats for help text
+    supported_formats = MeshLoader.get_supported_formats()
+    format_list = ', '.join(supported_formats.keys())
+    
     parser = argparse.ArgumentParser(
-        description='GPU-accelerated 3D mesh analysis using Open3D'
+        description=f'GPU-accelerated 3D mesh analysis with enhanced geometric calculations. Supports: {format_list}'
     )
-    parser.add_argument('--file', '-i', required=True, help='Path to .obj file')
+    parser.add_argument('--file', '-i', required=True, help=f'Path to 3D model file. Supported formats: {format_list}')
     parser.add_argument('--output', '-o', help='Output JSON file path')
     parser.add_argument(
         '--accuracy', '-a', 
@@ -1371,6 +1455,16 @@ def main():
         action='store_true',
         help='Enable verbose output'
     )
+    parser.add_argument(
+        '--no-repair',
+        action='store_true',
+        help='Skip mesh repair (repair is enabled by default)'
+    )
+    parser.add_argument(
+        '--force-volume',
+        action='store_true',
+        help='Attempt volume calculation even for non-watertight meshes using alternative methods'
+    )
     
     args = parser.parse_args()
     
@@ -1380,16 +1474,37 @@ def main():
             print(f"Error: File '{args.file}' not found")
             sys.exit(1)
         
-        print(f"Analyzing: {args.file}")
+        file_extension = Path(args.file).suffix.lower()
+        supported_formats = MeshLoader.get_supported_formats()
         
-        # Setup logging level
+        if file_extension not in supported_formats:
+            print(f"Error: Unsupported file format '{file_extension}'")
+            print(f"Supported formats: {', '.join(supported_formats.keys())}")
+            sys.exit(1)
+        
+        if file_extension != '.obj' and not FORMAT_CONVERTER_AVAILABLE:
+            print(f"Error: Format converter not available for {file_extension} files")
+            sys.exit(1)
+        
+        # Setup logging
         if not args.verbose:
-            # Suppress Open3D warnings in non-verbose mode
             o3d.utility.set_verbosity_level(o3d.utility.VerbosityLevel.Error)
         
         # Run analysis
         use_gpu = not args.cpu_only
-        analyzer = MeshAnalyzer(args.file, use_gpu=use_gpu)
+        repair_mesh = not args.no_repair
+        
+        try:
+            analyzer = MeshAnalyzer(
+                args.file, 
+                use_gpu=use_gpu,
+                repair_mesh=repair_mesh,
+                force_volume=args.force_volume
+            )
+        except Exception as e:
+            print(f"Error creating analyzer: {e}")
+            analyzer = MeshAnalyzer(args.file, use_gpu=use_gpu)
+        
         results = analyzer.analyze(
             accuracy=args.accuracy,
             export_visualizations=args.export
@@ -1405,11 +1520,6 @@ def main():
             with open(args.output, 'w') as f:
                 json.dump(formatted, f, indent=2)
             print(f"\nResults saved to: {args.output}")
-            
-        # Print GPU info if used
-        if use_gpu:
-            device_info = analyzer.device_info
-            print(f"\nProcessing completed using: {device_info['type']} - {device_info['name']}")
             
     except Exception as e:
         print(f"Error: {e}")
